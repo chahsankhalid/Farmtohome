@@ -4,10 +4,12 @@ export default async function handler(req, res) {
       return res.status(405).end();
     }
 
-    // =========================
-    // ✅ TOPIC CHECK
-    // =========================
+    // ============================================================
+    // TOPIC CHECK
+    // ============================================================
+
     const topic = req.headers["x-shopify-topic"];
+
     console.log("📢 Webhook topic:", topic);
 
     const allowedTopics = ["orders/create", "orders/paid"];
@@ -17,9 +19,10 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // =========================
-    // ✅ GET ORDER
-    // =========================
+    // ============================================================
+    // GET ORDER
+    // ============================================================
+
     const order = req.body;
 
     if (!order?.id) {
@@ -28,12 +31,17 @@ export default async function handler(req, res) {
     }
 
     console.log("🧾 Shopify order received:", order.id);
+    console.log("🧾 Order name:", order.name);
 
-    // =========================
-    // ✅ PREVENT DUPLICATES
-    // =========================
+
+    // ============================================================
+    // PREVENT DUPLICATES
+    // ============================================================
+
     const alreadyProcessed = order.note_attributes?.some(
-      attr => attr.name === "Processed-By"
+      attr =>
+        attr.name?.toLowerCase() === "processed-by" &&
+        attr.value === "middleware"
     );
 
     if (alreadyProcessed) {
@@ -41,156 +49,917 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // =========================
-    // ✅ CHECK RECHARGE ORDER
-    // =========================
+
+    // ============================================================
+    // DETECT RECHARGE / SUBSCRIPTION ORDER
+    // ============================================================
+
     const isRecharge =
       order.source_name === "subscription_contract" ||
       order.tags?.toLowerCase().includes("subscription") ||
-      order.line_items?.some(item => item.selling_plan_allocation);
+      order.line_items?.some(
+        item => item.selling_plan_allocation
+      );
 
-    if (!isRecharge) {
-      console.log("⏭️ Not a subscription order");
-      return res.status(200).end();
-    }
+    console.log("🔄 Recharge/subscription:", isRecharge);
 
-    // =========================
-    // ✅ GET DELIVERY STRING
-    // =========================
+
+    // ============================================================
+    // READ EXISTING ORDER ATTRIBUTES
+    // ============================================================
+
+    const existingAttributes = [
+      ...(order.note_attributes || [])
+    ];
+
     let deliveryString = null;
+    let deliveryDay = null;
+    let deliveryTime = null;
 
-    if (order.note_attributes?.length) {
-      deliveryString = order.note_attributes.find(
-        a => a.name?.toLowerCase() === "delivery date"
-      )?.value;
+
+    // ============================================================
+    // FIND DELIVERY DATE
+    // ============================================================
+
+    const deliveryDateAttribute = existingAttributes.find(
+      attr =>
+        attr.name?.toLowerCase() === "delivery date"
+    );
+
+    if (deliveryDateAttribute?.value) {
+      deliveryString = String(
+        deliveryDateAttribute.value
+      ).trim();
     }
+
+
+    // ============================================================
+    // FIND delivery_day
+    // ============================================================
+
+    const deliveryDayAttribute = existingAttributes.find(
+      attr =>
+        attr.name?.toLowerCase() === "delivery_day"
+    );
+
+    if (deliveryDayAttribute?.value) {
+      deliveryDay = String(
+        deliveryDayAttribute.value
+      ).trim();
+    }
+
+
+    // ============================================================
+    // FIND delivery_time
+    // ============================================================
+
+    const deliveryTimeAttribute = existingAttributes.find(
+      attr =>
+        attr.name?.toLowerCase() === "delivery_time"
+    );
+
+    if (deliveryTimeAttribute?.value) {
+      deliveryTime = String(
+        deliveryTimeAttribute.value
+      ).trim();
+    }
+
+
+    // ============================================================
+    // ALSO CHECK LINE ITEM PROPERTIES
+    // ============================================================
 
     if (!deliveryString) {
       for (const item of order.line_items || []) {
         for (const prop of item.properties || []) {
-          if (prop.name?.toLowerCase() === "delivery date") {
-            deliveryString = prop.value;
+          if (
+            prop.name?.toLowerCase() === "delivery date" &&
+            prop.value
+          ) {
+            deliveryString = String(
+              prop.value
+            ).trim();
+
+            break;
           }
+        }
+
+        if (deliveryString) break;
+      }
+    }
+
+
+    console.log(
+      "📦 Existing Delivery date:",
+      deliveryString
+    );
+
+    console.log(
+      "📅 Existing delivery_day:",
+      deliveryDay
+    );
+
+    console.log(
+      "⏰ Existing delivery_time:",
+      deliveryTime
+    );
+
+
+    // ============================================================
+    // DETERMINE WHETHER EXISTING DATE SHOULD BE PRESERVED
+    // OR RECALCULATED
+    // ============================================================
+
+    let shouldRecalculate = false;
+
+
+    // ------------------------------------------------------------
+    // CASE 1
+    //
+    // No delivery date exists.
+    //
+    // This includes:
+    //
+    // Direct Shopify checkout
+    // Recharge order without delivery information
+    // ------------------------------------------------------------
+
+    if (!deliveryString) {
+      console.log(
+        "⚠️ No Delivery date found"
+      );
+
+      shouldRecalculate = true;
+    }
+
+
+    // ------------------------------------------------------------
+    // CASE 2
+    //
+    // Recharge renewal.
+    //
+    // If Recharge copied an OLD delivery date into the new order,
+    // the delivery date will be before the new order date.
+    //
+    // In that situation we calculate a new delivery date.
+    // ------------------------------------------------------------
+
+    if (isRecharge && deliveryString) {
+      const existingDeliveryDate =
+        parseDeliveryDate(deliveryString);
+
+      if (existingDeliveryDate) {
+        const orderDate =
+          getLisbonCalendarDate(
+            order.created_at
+          );
+
+        const deliveryDate =
+          getLisbonCalendarDate(
+            existingDeliveryDate.toISOString()
+          );
+
+        console.log(
+          "📅 Order calendar date:",
+          orderDate
+        );
+
+        console.log(
+          "📅 Existing delivery calendar date:",
+          deliveryDate
+        );
+
+
+        if (deliveryDate < orderDate) {
+          console.log(
+            "🔄 Recharge renewal detected"
+          );
+
+          console.log(
+            "⚠️ Existing delivery date is in the past"
+          );
+
+          shouldRecalculate = true;
         }
       }
     }
 
-    if (!deliveryString) {
-      console.log("❌ No delivery string found");
-      return res.status(200).end();
+
+    // ============================================================
+    // CALCULATE NEW DELIVERY
+    // ============================================================
+
+    if (shouldRecalculate) {
+      const defaultDelivery =
+        getDefaultDelivery(
+          order.created_at
+        );
+
+      deliveryString =
+        defaultDelivery.deliveryString;
+
+      deliveryDay =
+        defaultDelivery.deliveryDay;
+
+      deliveryTime =
+        defaultDelivery.deliveryTime;
+
+
+      console.log(
+        "📦 New delivery date:",
+        deliveryString
+      );
+
+      console.log(
+        "📅 New delivery day:",
+        deliveryDay
+      );
+
+      console.log(
+        "⏰ New delivery time:",
+        deliveryTime
+      );
     }
 
-    console.log("📦 Delivery string:", deliveryString);
 
-    // =========================
-    // ✅ EXTRACT DELIVERY INFO
-    // =========================
-    const extracted = extractDeliveryInfo(deliveryString);
+    // ============================================================
+    // IF EXISTING DELIVERY WAS KEPT
+    // MAKE SURE delivery_day AND delivery_time EXIST
+    // ============================================================
 
-    if (!extracted) {
-      console.log("❌ Failed to parse delivery string");
-      return res.status(200).end();
+    if (deliveryString) {
+      const extracted =
+        extractDeliveryInfo(
+          deliveryString
+        );
+
+      if (extracted) {
+
+        if (!deliveryDay) {
+          deliveryDay =
+            normalizeDay(
+              extracted.day
+            );
+        }
+
+        if (!deliveryTime) {
+          deliveryTime =
+            extracted.time;
+        }
+      }
     }
 
-    console.log("📊 Extracted:", extracted);
 
-    // =========================
-    // ✅ CALCULATE NEXT DELIVERY DATE (KEY FIX)
-    // =========================
-    const nextDate = getNextWeekday(
-      new Date(order.created_at),
-      extracted.day.toLowerCase()
-    );
+    // ============================================================
+    // FINAL SAFETY DEFAULTS
+    // ============================================================
 
-    const formattedDate = nextDate.toLocaleDateString("en-GB", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric"
-    });
+    if (!deliveryDay) {
+      deliveryDay = "wednesday";
+    }
 
-    const finalDelivery = `${extracted.day} (${extracted.time}) - ${formattedDate}`;
+    if (!deliveryTime) {
+      deliveryTime = "19:00-21:00";
+    }
 
-    console.log("📅 Final delivery:", finalDelivery);
 
-    // =========================
-    // ✅ UPDATE ATTRIBUTES
-    // =========================
-    const existingAttributes = order.note_attributes || [];
+    // ============================================================
+    // UPDATE ATTRIBUTES
+    //
+    // IMPORTANT:
+    //
+    // We start with ALL existing attributes.
+    //
+    // Therefore:
+    //
+    // Marketing WhatsApp → preserved
+    // Marketing Email    → preserved
+    // Recharge fields    → preserved
+    // Other attributes   → preserved
+    //
+    // Only delivery fields are changed.
+    // ============================================================
 
     const updatedAttributes = [
-      ...existingAttributes.filter(
-        a => a.name?.toLowerCase() !== "delivery date"
-      ),
-      {
-        name: "Delivery date",
-        value: finalDelivery
-      },
-      {
-        name: "Processed-By",
-        value: "middleware"
-      }
+      ...existingAttributes
     ];
 
-    // =========================
-    // ✅ UPDATE SHOPIFY ORDER
-    // =========================
-    const response = await fetch(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-01/orders/${order.id}.json`,
+
+    upsertAttribute(
+      updatedAttributes,
+      "delivery_day",
+      deliveryDay
+    );
+
+
+    upsertAttribute(
+      updatedAttributes,
+      "delivery_time",
+      deliveryTime
+    );
+
+
+    upsertAttribute(
+      updatedAttributes,
+      "Delivery date",
+      deliveryString
+    );
+
+
+    upsertAttribute(
+      updatedAttributes,
+      "Processed-By",
+      "middleware"
+    );
+
+
+    console.log(
+      "📝 Final order attributes:",
+      updatedAttributes
+    );
+
+
+    // ============================================================
+    // UPDATE SHOPIFY ORDER
+    // ============================================================
+
+    const shopifyResponse = await fetch(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2026-07/graphql.json`,
       {
-        method: "PUT",
+        method: "POST",
+
         headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_TOKEN,
-          "Content-Type": "application/json"
+          "X-Shopify-Access-Token":
+            process.env.SHOPIFY_TOKEN,
+
+          "Content-Type":
+            "application/json"
         },
+
         body: JSON.stringify({
-          order: {
-            id: order.id,
-            note_attributes: updatedAttributes
+          query: `
+            mutation OrderUpdate($input: OrderInput!) {
+              orderUpdate(input: $input) {
+                order {
+                  id
+
+                  customAttributes {
+                    key
+                    value
+                  }
+                }
+
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `,
+
+          variables: {
+            input: {
+              id:
+                `gid://shopify/Order/${order.id}`,
+
+              customAttributes:
+                updatedAttributes.map(attr => ({
+                  key: attr.name,
+                  value: String(
+                    attr.value ?? ""
+                  )
+                }))
+            }
           }
         })
       }
     );
 
-    const data = await response.json();
-    console.log("✅ Shopify updated:", data);
 
-    return res.status(200).send("Updated");
+    const data =
+      await shopifyResponse.json();
+
+
+    console.log(
+      "📡 Shopify response:",
+      JSON.stringify(
+        data,
+        null,
+        2
+      )
+    );
+
+
+    // ============================================================
+    // SHOPIFY HTTP ERROR
+    // ============================================================
+
+    if (!shopifyResponse.ok) {
+      console.error(
+        "❌ Shopify HTTP error:",
+        shopifyResponse.status,
+        data
+      );
+
+      return res
+        .status(500)
+        .send("Shopify API error");
+    }
+
+
+    // ============================================================
+    // GRAPHQL ERROR
+    // ============================================================
+
+    if (data.errors?.length) {
+      console.error(
+        "❌ Shopify GraphQL errors:",
+        data.errors
+      );
+
+      return res
+        .status(500)
+        .send("Shopify GraphQL error");
+    }
+
+
+    // ============================================================
+    // USER ERRORS
+    // ============================================================
+
+    const userErrors =
+      data.data?.orderUpdate?.userErrors || [];
+
+
+    if (userErrors.length) {
+      console.error(
+        "❌ Shopify orderUpdate errors:",
+        userErrors
+      );
+
+      return res
+        .status(500)
+        .send(
+          "Shopify order update failed"
+        );
+    }
+
+
+    console.log(
+      "✅ Shopify order updated:",
+      order.id
+    );
+
+
+    return res
+      .status(200)
+      .send("Updated");
 
   } catch (err) {
-    console.error("❌ Webhook error:", err);
-    return res.status(500).send("Error");
+
+    console.error(
+      "❌ Webhook error:",
+      err
+    );
+
+    return res
+      .status(500)
+      .send("Error");
   }
 }
 
-// =========================
-// ✅ EXTRACT DELIVERY INFO
-// =========================
-function extractDeliveryInfo(deliveryString) {
+
+// ============================================================
+// EXTRACT DELIVERY INFO
+// ============================================================
+
+function extractDeliveryInfo(
+  deliveryString
+) {
   try {
-    const [dayTime, datePart] = deliveryString.split(" - ");
 
-    const dayMatch = dayTime.match(/^(.*?) \(/);
-    const timeMatch = dayTime.match(/\((.*?)\)/);
+    const parts =
+      deliveryString.split(" - ");
 
-    const day = dayMatch?.[1]?.trim();
-    const time = timeMatch?.[1]?.trim();
-    const date = datePart?.trim();
+    const dayTime =
+      parts[0];
 
-    if (!day || !time || !date) return null;
+    const datePart =
+      parts.slice(1).join(" - ");
 
-    return { day, time, date };
+
+    const dayMatch =
+      dayTime.match(
+        /^(.*?)\s*\(/
+      );
+
+
+    const timeMatch =
+      dayTime.match(
+        /\((.*?)\)/
+      );
+
+
+    const day =
+      dayMatch?.[1]?.trim();
+
+    const time =
+      timeMatch?.[1]?.trim();
+
+    const date =
+      datePart?.trim();
+
+
+    if (
+      !day ||
+      !time ||
+      !date
+    ) {
+      return null;
+    }
+
+
+    return {
+      day,
+      time,
+      date
+    };
 
   } catch (err) {
-    console.error("❌ Extraction failed:", err);
+
+    console.error(
+      "❌ Delivery extraction failed:",
+      err
+    );
+
     return null;
   }
 }
 
-// =========================
-// ✅ GET NEXT WEEKDAY
-// =========================
-function getNextWeekday(date, targetDayName) {
+
+// ============================================================
+// PARSE DELIVERY DATE
+//
+// Supports:
+//
+// 19 Aug 2026
+// 19/08/2026
+// 19-08-2026
+// ============================================================
+
+function parseDeliveryDate(
+  deliveryString
+) {
+  try {
+
+    const extracted =
+      extractDeliveryInfo(
+        deliveryString
+      );
+
+    if (!extracted?.date) {
+      return null;
+    }
+
+
+    const dateString =
+      extracted.date.trim();
+
+
+    // ----------------------------------------------------------
+    // DD/MM/YYYY
+    // ----------------------------------------------------------
+
+    let match =
+      dateString.match(
+        /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/
+      );
+
+
+    if (match) {
+
+      const day =
+        Number(match[1]);
+
+      const month =
+        Number(match[2]) - 1;
+
+      const year =
+        Number(match[3]);
+
+
+      return new Date(
+        Date.UTC(
+          year,
+          month,
+          day
+        )
+      );
+    }
+
+
+    // ----------------------------------------------------------
+    // DD-MM-YYYY
+    // ----------------------------------------------------------
+
+    match =
+      dateString.match(
+        /^(\d{1,2})-(\d{1,2})-(\d{4})$/
+      );
+
+
+    if (match) {
+
+      const day =
+        Number(match[1]);
+
+      const month =
+        Number(match[2]) - 1;
+
+      const year =
+        Number(match[3]);
+
+
+      return new Date(
+        Date.UTC(
+          year,
+          month,
+          day
+        )
+      );
+    }
+
+
+    // ----------------------------------------------------------
+    // DD Mon YYYY
+    //
+    // Example:
+    // 19 Aug 2026
+    // ----------------------------------------------------------
+
+    match =
+      dateString.match(
+        /^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/
+      );
+
+
+    if (match) {
+
+      const day =
+        Number(match[1]);
+
+      const monthName =
+        match[2].toLowerCase();
+
+      const year =
+        Number(match[3]);
+
+
+      const months = {
+        jan: 0,
+        january: 0,
+
+        feb: 1,
+        february: 1,
+
+        mar: 2,
+        march: 2,
+
+        apr: 3,
+        april: 3,
+
+        may: 4,
+
+        jun: 5,
+        june: 5,
+
+        jul: 6,
+        july: 6,
+
+        aug: 7,
+        august: 7,
+
+        sep: 8,
+        sept: 8,
+        september: 8,
+
+        oct: 9,
+        october: 9,
+
+        nov: 10,
+        november: 10,
+
+        dec: 11,
+        december: 11
+      };
+
+
+      if (
+        months[monthName] === undefined
+      ) {
+        return null;
+      }
+
+
+      return new Date(
+        Date.UTC(
+          year,
+          months[monthName],
+          day
+        )
+      );
+    }
+
+
+    return null;
+
+  } catch (err) {
+
+    console.error(
+      "❌ Date parsing failed:",
+      err
+    );
+
+    return null;
+  }
+}
+
+
+// ============================================================
+// GET LISBON CALENDAR DATE
+//
+// Returns:
+// YYYY-MM-DD
+//
+// This prevents timezone/DST issues.
+// ============================================================
+
+function getLisbonCalendarDate(
+  dateInput
+) {
+
+  const date =
+    new Date(dateInput);
+
+
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone:
+          "Europe/Lisbon",
+
+        year:
+          "numeric",
+
+        month:
+          "2-digit",
+
+        day:
+          "2-digit"
+      }
+    ).formatToParts(date);
+
+
+  const year =
+    parts.find(
+      p => p.type === "year"
+    )?.value;
+
+
+  const month =
+    parts.find(
+      p => p.type === "month"
+    )?.value;
+
+
+  const day =
+    parts.find(
+      p => p.type === "day"
+    )?.value;
+
+
+  return `${year}-${month}-${day}`;
+}
+
+
+// ============================================================
+// NORMALIZE DAY
+// ============================================================
+
+function normalizeDay(day) {
+
+  const dayMap = {
+
+    sunday:
+      "sunday",
+
+    monday:
+      "monday",
+
+    tuesday:
+      "tuesday",
+
+    wednesday:
+      "wednesday",
+
+    thursday:
+      "thursday",
+
+    friday:
+      "friday",
+
+    saturday:
+      "saturday",
+
+
+    domingo:
+      "sunday",
+
+    "segunda-feira":
+      "monday",
+
+    "terça-feira":
+      "tuesday",
+
+    "terca-feira":
+      "tuesday",
+
+    "quarta-feira":
+      "wednesday",
+
+    "quinta-feira":
+      "thursday",
+
+    "sexta-feira":
+      "friday",
+
+    "sábado":
+      "saturday",
+
+    sabado:
+      "saturday"
+  };
+
+
+  return (
+    dayMap[
+      day?.toLowerCase()
+    ] ||
+    "wednesday"
+  );
+}
+
+
+// ============================================================
+// DEFAULT DELIVERY
+//
+// EXACTLY MATCHES YOUR CART LOGIC:
+//
+// Sunday    → upcoming Wednesday
+// Monday    → following Wednesday
+// Tuesday   → following Wednesday
+// Wednesday → following Wednesday
+// Thursday  → upcoming Wednesday
+// Friday    → upcoming Wednesday
+// Saturday  → upcoming Wednesday
+//
+// Default time:
+//
+// 19:00-21:00
+// ============================================================
+
+function getDefaultDelivery(
+  createdAt
+) {
+
+  const orderDate =
+    new Date(createdAt);
+
+
+  // Get weekday in Lisbon.
+
+  const weekdayFormatter =
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone:
+          "Europe/Lisbon",
+
+        weekday:
+          "long"
+      }
+    );
+
+
+  const weekdayName =
+    weekdayFormatter
+      .format(orderDate)
+      .toLowerCase();
+
+
   const daysMap = {
+
     sunday: 0,
     monday: 1,
     tuesday: 2,
@@ -198,14 +967,202 @@ function getNextWeekday(date, targetDayName) {
     thursday: 4,
     friday: 5,
     saturday: 6
+
   };
 
-  const targetDay = daysMap[targetDayName];
-  const d = new Date(date);
 
-  let diff = (targetDay - d.getDay() + 7) % 7;
-  if (diff === 0) diff = 7;
+  const currentDay =
+    daysMap[weekdayName];
 
-  d.setDate(d.getDate() + diff);
-  return d;
+
+  let daysUntilWednesday;
+
+
+  // ----------------------------------------------------------
+  // Monday
+  // ----------------------------------------------------------
+
+  if (currentDay === 1) {
+
+    daysUntilWednesday = 9;
+
+  }
+
+  // ----------------------------------------------------------
+  // Tuesday
+  // ----------------------------------------------------------
+
+  else if (currentDay === 2) {
+
+    daysUntilWednesday = 8;
+
+  }
+
+  // ----------------------------------------------------------
+  // Wednesday
+  // ----------------------------------------------------------
+
+  else if (currentDay === 3) {
+
+    daysUntilWednesday = 7;
+
+  }
+
+  // ----------------------------------------------------------
+  // Thursday-Sunday
+  // ----------------------------------------------------------
+
+  else {
+
+    daysUntilWednesday =
+      (3 - currentDay + 7) % 7;
+
+
+    if (
+      daysUntilWednesday === 0
+    ) {
+      daysUntilWednesday = 7;
+    }
+  }
+
+
+  // ==========================================================
+  // GET ORDER CALENDAR DATE IN LISBON
+  // ==========================================================
+
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone:
+          "Europe/Lisbon",
+
+        year:
+          "numeric",
+
+        month:
+          "2-digit",
+
+        day:
+          "2-digit"
+      }
+    ).formatToParts(orderDate);
+
+
+  const year =
+    Number(
+      parts.find(
+        p => p.type === "year"
+      )?.value
+    );
+
+
+  const month =
+    Number(
+      parts.find(
+        p => p.type === "month"
+      )?.value
+    );
+
+
+  const day =
+    Number(
+      parts.find(
+        p => p.type === "day"
+      )?.value
+    );
+
+
+  // ==========================================================
+  // CREATE DELIVERY DATE
+  // ==========================================================
+
+  const deliveryDate =
+    new Date(
+      Date.UTC(
+        year,
+        month - 1,
+        day + daysUntilWednesday
+      )
+    );
+
+
+  const formattedDate =
+    deliveryDate.toLocaleDateString(
+      "en-GB",
+      {
+        timeZone:
+          "UTC",
+
+        day:
+          "2-digit",
+
+        month:
+          "short",
+
+        year:
+          "numeric"
+      }
+    );
+
+
+  return {
+
+    deliveryDay:
+      "wednesday",
+
+    deliveryTime:
+      "19:00-21:00",
+
+    deliveryString:
+      `Wednesday (19:00-21:00) - ${formattedDate}`
+
+  };
+}
+
+
+// ============================================================
+// UPSERT ATTRIBUTE
+// ============================================================
+
+function upsertAttribute(
+  attributes,
+  name,
+  value
+) {
+
+  const index =
+    attributes.findIndex(
+      attr =>
+        attr.name?.toLowerCase() ===
+        name.toLowerCase()
+    );
+
+
+  const newAttribute = {
+
+    name,
+
+    value:
+      String(
+        value ?? ""
+      )
+
+  };
+
+
+  if (index >= 0) {
+
+    attributes[index] =
+      newAttribute;
+
+  } else {
+
+    attributes.push(
+      newAttribute
+    );
+  }
+
+
+  return attributes;
 }
