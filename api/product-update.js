@@ -204,16 +204,17 @@ async function processRemovalOnly(product) {
       console.log(`⚠️ Handling removal for sub ${sub.id}`);
 
       // ================= EMAIL =================
-      if (sub.email) {
-        const category =
-          getPrimaryCategory(extractTags(product.tags)) || "this dish category";
+      
+     // if (sub.email) {
+      //  const category =
+       //   getPrimaryCategory(extractTags(product.tags)) || "this dish category";
 
-        await sendRemovalEmail(
-          sub.email,
-          sub.product_title,
-          category
-        );
-      }
+       // await sendRemovalEmail(
+       //   sub.email,
+        //  sub.product_title,
+        //  category
+       // );
+    //  }
 
       // ================= OPTIONAL: PREVENT REAPPEAR =================
       try {
@@ -432,15 +433,15 @@ async function processRecharge(product, replacement) {
     
       await swapSubscription(sub, replacement);
       // ✅ SEND EMAIL (only once per customer)
-      const customerEmail = sub.email;
-      console.log("📩 Subscription email:", sub.email);
-      if (customerEmail) {
-        await sendEmailNotification(
-          customerEmail,
-          sub.product_title,
-          replacement.title
-        );
-      }
+     // const customerEmail = sub.email;
+     // console.log("📩 Subscription email:", sub.email);
+     // if (customerEmail) {
+      //  await sendEmailNotification(
+       //   customerEmail,
+        //  sub.product_title,
+        //  replacement.title
+     //   );
+    //  }
       await delay(200);
     }
     page++;
